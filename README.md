@@ -6,7 +6,7 @@
 
 [![Release](https://img.shields.io/github/v/release/Secret787/obsidian-rest-api-agent?style=flat-square&color=7c3aed)](https://github.com/Secret787/obsidian-rest-api-agent/releases)
 [![License](https://img.shields.io/github/license/Secret787/obsidian-rest-api-agent?style=flat-square&color=22c55e)](LICENSE)
-[![Obsidian](https://img.shields.io/badge/Obsidian-%E2%89%A51.0.0-7c3aed?style=flat-square&logo=obsidian&logoColor=white)](https://obsidian.md)
+[![Obsidian](https://img.shields.io/badge/Obsidian-1.0.0%2B-7c3aed?style=flat-square&logo=obsidian&logoColor=white)](https://obsidian.md)
 [![Platform](https://img.shields.io/badge/platform-desktop-64748b?style=flat-square)](#платформы)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-22c55e?style=flat-square)](https://github.com/Secret787/obsidian-rest-api-agent/pulls)
 
