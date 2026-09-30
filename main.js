@@ -108,6 +108,7 @@ class RestApiPlugin extends Plugin {
       await this.saveSettings();
     }
     this._authFails = new Map();
+    this._cleanupTimer = window.setInterval(() => this._rateLimitCleanup(), RATE_WINDOW_MS);
     this.addSettingTab(new RestApiSettingTab(this.app, this));
     this.restartServer();
     console.log(
@@ -118,6 +119,7 @@ class RestApiPlugin extends Plugin {
 
   async onunload() {
     this.stopServer();
+    if (this._cleanupTimer) { window.clearInterval(this._cleanupTimer); this._cleanupTimer = null; }
     console.log("[REST API] unloaded");
   }
 
@@ -267,16 +269,22 @@ class RestApiPlugin extends Plugin {
   }
 
   rateLimitOk(ip) {
+    const now = Date.now();
     const e = this._authFails.get(ip);
-    if (!e) return true;
-    if (Date.now() > e.resetAt) { this._authFails.delete(ip); return true; }
+    if (!e || now > e.resetAt) return true;
     return e.count < this.settings.rateLimitPerMin;
   }
-  rateLimitFail(ip) {
+  rateLimitHit(ip) {
     const now = Date.now();
     const e = this._authFails.get(ip);
     if (!e || now > e.resetAt) this._authFails.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
     else e.count++;
+  }
+  _rateLimitCleanup() {
+    const now = Date.now();
+    for (const [ip, e] of this._authFails) {
+      if (now > e.resetAt) this._authFails.delete(ip);
+    }
   }
 
   sanitizePath(path) {
@@ -289,7 +297,9 @@ class RestApiPlugin extends Plugin {
     if (clean.startsWith("//")) return null;
     for (const p of clean.split("/")) {
       if (p === ".." || p === ".") return null;
-      if (p === ".obsidian" || p.startsWith(".obsidian.")) return null;
+      const lp = p.toLowerCase();
+      if (lp.startsWith(".obsidian")) return null;
+      if (lp === ".trash" || lp === ".git" || lp === ".smart-env") return null;
     }
     return normalizePath(clean);
   }
@@ -326,21 +336,14 @@ class RestApiPlugin extends Plugin {
     if (!this.rateLimitOk(ip)) {
       return this.sendError(res, new ApiError(429, "too_many_requests", "Too many requests"));
     }
+    this.rateLimitHit(ip);
 
     // /health — публичный liveness-эндпоинт, без токена
     if (pathname === "/health" && req.method === "GET") {
-      return this.sendJson(res, 200, {
-        status: "ok",
-        version: "1.0.0",
-        file_count: this.app.vault.getFiles().length,
-        uptime_sec: Math.round(process.uptime()),
-        bind_host: this.settings.bindHost,
-        read_only: this.settings.readOnly,
-      });
+      return this.sendJson(res, 200, { status: "ok" });
     }
 
     if (!this.safeEqual(token, this.settings.token)) {
-      this.rateLimitFail(ip);
       return this.sendError(res, new ApiError(401, "unauthorized", "Invalid or missing token"));
     }
     if (this.settings.readOnly && ["PUT", "POST", "DELETE", "PATCH"].includes(req.method)) {
@@ -434,12 +437,20 @@ class RestApiPlugin extends Plugin {
         await this.writeBinary(p, rawBody);
         return this.sendJson(res, 200, { ok: true, size: rawBody.length, mime: mimeOf(p) });
       }
+      if (Buffer.byteLength(body, "utf8") > this.settings.maxFileSize) {
+        throw new ApiError(413, "payload_too_large",
+          "File exceeds max size (" + this.settings.maxFileSize + " bytes)");
+      }
       await this.writeFile(p, body, "overwrite");
       return this.sendJson(res, 200, { ok: true });
     }
     if (req.method === "POST") {
       if (isListing) throw new ApiError(400, "invalid_request", "Cannot append to a directory");
       if (!isTextPath(p)) throw new ApiError(400, "invalid_request", "Append not supported for binary files");
+      if (Buffer.byteLength(body, "utf8") > this.settings.maxFileSize) {
+        throw new ApiError(413, "payload_too_large",
+          "Append exceeds max size (" + this.settings.maxFileSize + " bytes)");
+      }
       await this.writeFile(p, body, "append");
       return this.sendJson(res, 200, { ok: true });
     }
@@ -486,7 +497,15 @@ class RestApiPlugin extends Plugin {
       for (const f of files) {
         const p = this.sanitizePath(f && f.path);
         if (p === null) continue;
-        backups.push({ path: p, content: await this.readFile(p) });
+        if (!isTextPath(p)) {
+          throw new ApiError(400, "invalid_request", "Binary files are not supported by batch/write");
+        }
+        const exists = await this.app.vault.adapter.exists(p);
+        const content = exists ? await this.readFile(p) : null;
+        if (exists && content === null) {
+          throw new ApiError(413, "payload_too_large", "Cannot back up existing file (too large): " + p);
+        }
+        backups.push({ path: p, existed: exists, content });
       }
       const results = [];
       try {
@@ -500,8 +519,8 @@ class RestApiPlugin extends Plugin {
       } catch (e) {
         for (const b of backups) {
           try {
-            if (b.content === null) await this.deleteFile(b.path);
-            else await this.writeFile(b.path, b.content, "overwrite");
+            if (!b.existed) await this.deleteFile(b.path);
+            else if (b.content !== null) await this.writeFile(b.path, b.content, "overwrite");
           } catch (_) {}
         }
         throw new ApiError(409, "conflict", "Atomic batch failed; rolled back", { rolled_back: backups.length });
@@ -511,11 +530,12 @@ class RestApiPlugin extends Plugin {
     const results = [];
     for (const f of files) {
       const p = this.sanitizePath(f && f.path);
-      if (p === null) { results.push({ path: String(f && f.path), ok: false }); continue; }
+      if (p === null) { results.push({ path: String(f && f.path), ok: false, error: "invalid_path" }); continue; }
+      if (!isTextPath(p)) { results.push({ path: String(f && f.path), ok: false, error: "binary_not_supported" }); continue; }
       try {
         await this.writeFile(p, String((f && f.content) || ""), f && f.mode === "append" ? "append" : "overwrite");
         results.push({ path: String(f.path), ok: true });
-      } catch (_) { results.push({ path: String(f.path), ok: false }); }
+      } catch (_) { results.push({ path: String(f.path), ok: false, error: "internal" }); }
     }
     this.sendJson(res, 200, { results });
   }
@@ -544,6 +564,10 @@ class RestApiPlugin extends Plugin {
         continue;
       }
       try {
+        if (!isTextPath(from) || !isTextPath(to)) {
+          results.push({ from: String(mv.from), to: String(mv.to), ok: false, error: "binary_not_supported" });
+          continue;
+        }
         const c = await this.readFile(from);
         if (c === null) { results.push({ from: String(mv.from), to: String(mv.to), ok: false, error: "not_found" }); continue; }
         if (await this.app.vault.adapter.exists(to)) {
@@ -1215,9 +1239,7 @@ class RestApiSettingTab extends PluginSettingTab {
       try {
         const res = await this.plugin.httpGetJson(loopbackUrl + "/health", {}, 3000);
         this.statusOk = res.ok && res.json && res.json.status === "ok";
-        new Notice(this.statusOk
-          ? "Сервер отвечает, файлов: " + (res.json && res.json.file_count)
-          : "Сервер ответил ошибкой " + res.status);
+        new Notice(this.statusOk ? "Сервер отвечает" : "Сервер ответил ошибкой " + res.status);
         setBadge(this.statusOk);
       } catch (e) {
         this.statusOk = false;

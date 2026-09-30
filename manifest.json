@@ -1,10 +1,10 @@
 {
   "id": "obsidian-rest-api-agent",
   "name": "REST API for Agents",
-  "version": "1.0.0",
-  "minAppVersion": "0.15.0",
+  "version": "1.0.1",
+  "minAppVersion": "1.0.0",
   "description": "Secure local REST API for AI agents and automation.",
   "author": "Kuznetsov Roman",
-  "authorUrl": "https://github.com/ваш-логин",
+  "authorUrl": "https://github.com/Secret787",
   "isDesktopOnly": true
 }
